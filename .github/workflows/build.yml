@@ -1,0 +1,117 @@
+name: "Build whisper.cpp (Metal)"
+
+"on":
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: "Tag/branch do whisper.cpp (a mesma build do motor em CPU do app)"
+        required: true
+        default: "b5454"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      WHISPER_REF: ${{ inputs.whisper_ref }}
+    steps:
+      - name: Checkout whisper.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.whisper_ref }}
+
+      # Uma compilação por arquitetura, juntadas depois com lipo. Compilar as
+      # duas de uma vez (CMAKE_OSX_ARCHITECTURES="arm64;x86_64") faz o ggml não
+      # reconhecer a CPU e cair no código genérico: medido, ~15x mais lento
+      # transcrevendo em CPU.
+      #
+      # Estático, com o Metal embutido e sem OpenMP: o binário só depende de
+      # frameworks do próprio macOS, nada para instalar no Mac de quem usa.
+      # As flags são as do build-xcframework.sh oficial do whisper.cpp.
+      - name: Compilar (arm64 e x86_64)
+        run: |
+          for arch in arm64 x86_64; do
+            cmake -S . -B "build-$arch" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_ARCHITECTURES="$arch" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DGGML_NATIVE=OFF \
+              -DGGML_OPENMP=OFF \
+              -DGGML_METAL=ON \
+              -DGGML_METAL_EMBED_LIBRARY=ON \
+              -DGGML_METAL_USE_BF16=ON \
+              -DGGML_CCACHE=OFF \
+              -DWHISPER_BUILD_TESTS=OFF \
+              -DWHISPER_BUILD_SERVER=OFF
+            cmake --build "build-$arch" --config Release -j --target whisper-cli
+          done
+
+      # Assinatura ad-hoc: gratuita, sem conta Apple. Sem nenhuma assinatura o
+      # macOS se recusa a rodar binário arm64.
+      - name: Juntar e assinar
+        id: pack
+        run: |
+          mkdir -p pack
+          lipo -create build-arm64/bin/whisper-cli build-x86_64/bin/whisper-cli -output pack/whisper-cli
+          codesign --force --sign - pack/whisper-cli
+          cp LICENSE pack/LICENSE
+          commit="$(git rev-parse HEAD)"
+          printf 'whisper.cpp %s\ncommit %s\n' "$WHISPER_REF" "$commit" > pack/VERSION.txt
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Conferir o binário
+        run: |
+          for arch in arm64 x86_64; do
+            lipo pack/whisper-cli -verify_arch "$arch"
+          done
+          codesign --verify --strict pack/whisper-cli
+          # Só bibliotecas do próprio macOS. Uma do Homebrew (ex.: libomp)
+          # funcionaria aqui no runner e quebraria no Mac de quem usa.
+          extra="$(otool -L pack/whisper-cli | grep -E '^\s' | grep -vE '^\s+(/System/Library/|/usr/lib/)' || true)"
+          if [ -n "$extra" ]; then
+            echo "::error::o binário depende de biblioteca de fora do macOS:"
+            echo "$extra"
+            exit 1
+          fi
+          otool -L pack/whisper-cli
+
+      # Uma transcrição de verdade com as mesmas flags que o Clipaisso passa
+      # (ver src-tauri/src/whisper/runner.rs). Em CPU (-ng), porque a máquina
+      # virtual do GitHub não garante GPU; o Metal foi testado num Mac real.
+      - name: Testar uma transcrição
+        run: |
+          mkdir -p smoke
+          curl -fsSL -o smoke/tiny.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
+          curl -fsSL -o smoke/vad.bin https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+          transcrever() {
+            rm -f smoke/out.json
+            "$@" -m smoke/tiny.bin -f samples/jfk.wav -of smoke/out -ojf -l en -t 4 -pp \
+              --dtw tiny --vad --vad-model smoke/vad.bin --suppress-nst -ng
+            grep -q "Americans" smoke/out.json
+          }
+          transcrever pack/whisper-cli
+          echo "arm64: ok"
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            transcrever arch -x86_64 pack/whisper-cli
+            echo "x86_64 (Rosetta): ok"
+          else
+            echo "::warning::Rosetta indisponível no runner: a metade Intel foi conferida mas não executada"
+          fi
+
+      - name: Empacotar
+        run: |
+          (cd pack && zip -X -r ../whisper-metal-bin-macos.zip .)
+          zipinfo whisper-metal-bin-macos.zip
+
+      - name: Publicar release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: whisper-metal-latest
+          name: "whisper.cpp Metal (latest)"
+          body: |
+            whisper.cpp `${{ inputs.whisper_ref }}` (commit `${{ steps.pack.outputs.commit }}`), compilado para macOS 13.3+ com Metal. Um binário só para Apple Silicon e Intel.
+          files: whisper-metal-bin-macos.zip
