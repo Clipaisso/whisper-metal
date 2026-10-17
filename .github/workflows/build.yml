@@ -18,7 +18,7 @@ jobs:
       WHISPER_REF: ${{ inputs.whisper_ref }}
     steps:
       - name: Checkout whisper.cpp
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ggml-org/whisper.cpp
           ref: ${{ inputs.whisper_ref }}
@@ -108,7 +108,7 @@ jobs:
           zipinfo whisper-metal-bin-macos.zip
 
       - name: Publicar release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: whisper-metal-latest
           name: "whisper.cpp Metal (latest)"
